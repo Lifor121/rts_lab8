@@ -7,6 +7,7 @@
 #include <random>
 #include <iomanip>
 #include <algorithm>
+#include <limits>
 
 
 // Структура координат
@@ -92,8 +93,8 @@ public:
     }
 
     // Подписка читателя 
-    bool subscribe(const unsigned int& id, NodePtr& stack_ptr) {
-        // 1. Сразу проверяем, не остановлена ли работа.
+    bool subscribe(const unsigned int& id, NodePtr& stack_ptr, uint64_t last_seen_version) {
+        // Сразу проверяем, не остановлена ли работа.
         // Если писатель остановился, новых версий не будет, выходим.
         if (stop_flag_.load()) return false;
 
@@ -101,7 +102,7 @@ public:
 
         // Цикл ожидания новой версии.
         // Выполняется, если читатель уже на актуальной версии.
-        while (sub.load(std::memory_order_relaxed) == stack_.version.load(std::memory_order_relaxed)) {
+        while (stack_.version.load(std::memory_order_relaxed) <= last_seen_version) {
             if (stop_flag_.load()) return false;
         }
 
@@ -177,17 +178,20 @@ double calculate_y(double x) {
 }
 
 // Проверка консистентности
-bool check_consistency(const std::vector<Position>& data, double step) {
+bool check_consistency(const std::vector<Position>& data) {
     if (data.empty()) return true;
+
+    double epsilon = std::numeric_limits<double>::epsilon();
 
     for (const auto& p : data) {
         double expected_y = calculate_y(p.x);
-        if (std::abs(p.y - expected_y) > 1e-4) return false;
+        // Строгая проверка с машинным эпсилоном
+        if (std::abs(p.y - expected_y) > epsilon) return false;
     }
 
     for (size_t i = 0; i < data.size() - 1; ++i) {
-        double diff = data[i].x - data[i + 1].x;
-        if (diff < 0) return false;
+        // Проверяем только убывание X
+        if (data[i].x <= data[i + 1].x) return false;
     }
     return true;
 }
@@ -196,6 +200,7 @@ void writer_thread_func(LockFreeVersionedStack<Position>& stack, double step) {
     double current_x = 0.0;
     std::mt19937 gen(std::random_device{}());
     std::uniform_int_distribution<> action_dist(0, 10);
+    int log_counter = 0;
 
     std::cout << "[Writer] Начало генерации координат..." << std::endl;
 
@@ -206,9 +211,10 @@ void writer_thread_func(LockFreeVersionedStack<Position>& stack, double step) {
         p.y = calculate_y(current_x);
         stack.push(p);
 
-        // Логирование прогресса
-        if (static_cast<int>(current_x * 100) % 20 == 0) {
-            std::cout << "[Writer] Выстрел: x=" << p.x << ", y=" << p.y << std::endl;
+        // Логирование прогресса (будем выводить каждое 20-ое сообщение)
+        if (++log_counter % 20 == 0) {
+            std::cout << "[Writer] Выстрел: x=" << p.x << ", y=" << p.y
+                << " (v: " << stack.get_current_version() << ")" << std::endl;
         }
 
         current_x += step;
@@ -219,7 +225,7 @@ void writer_thread_func(LockFreeVersionedStack<Position>& stack, double step) {
             for (int k = 0; k < pop_count; ++k) stack.pop();
         }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        std::this_thread::sleep_for(std::chrono::milliseconds(7));
     }
 
     std::cout << "[Writer] Конец генерации. Ждём читающие потоки 1 секунду..." << std::endl;
@@ -230,9 +236,12 @@ void writer_thread_func(LockFreeVersionedStack<Position>& stack, double step) {
 
 void reader_thread_func(LockFreeVersionedStack<Position>& stack, int id, double step, std::atomic<int>& versions_read) {
     LockFreeVersionedStack<Position>::NodePtr current_head = nullptr;
+    uint64_t last_seen_version = 0;
 
     // Чтение версий
-    while (stack.subscribe(id, current_head)) {
+    while (stack.subscribe(id, current_head, last_seen_version)) {
+        last_seen_version = stack.get_current_version();
+
         if (current_head == nullptr) {
             stack.unsubscribe(id);
             continue;
@@ -245,7 +254,7 @@ void reader_thread_func(LockFreeVersionedStack<Position>& stack, int id, double 
             node = node->next;
         }
 
-        if (!check_consistency(snapshot, step)) {
+        if (!check_consistency(snapshot)) {
             std::cerr << "[Reader " << id << "] ОШИБКА: Нарушена консистентность" << std::endl;
         }
 
@@ -261,7 +270,7 @@ int main() {
     setlocale(LC_ALL, "");
     const int NUM_READERS = 4;
     LockFreeVersionedStack<Position> stack(NUM_READERS);
-    double step = 0.01;
+    double step = pow(10, -3);
 
     std::cout << "Начало испытания \"По кому звонит Колокольчик\"..." << std::endl;
 
